@@ -1,258 +1,261 @@
 #include <Arduino.h>
-#include <Adafruit_AHTX0.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_NeoPixel.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <WiFi.h>
-#include <MQTT.h>
-#include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <Adafruit_NeoPixel.h>
+#include <Adafruit_AHTX0.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+
 
 #define WIRE Wire
 #define PIN 8
 #define NUMPIXELS 16
+#define BUTTON_PIN 9
 
 Adafruit_AHTX0 aht;
 Adafruit_SSD1306 display = Adafruit_SSD1306(128, 32, &WIRE);
 Adafruit_NeoPixel pixels(NUMPIXELS, PIN, NEO_GRB + NEO_KHZ800);
-WiFiClient wifiClient;
-MQTTClient client;
-AsyncWebServer server(80);
 
-const char* ssid = "Hesias";
-const char* pass = "bienvenuechezHesias";
+float temperaturefromnetwork;
+float humidityfromnetwork;
+char receivedfrom[18];
+uint8_t redfromnetwork;
+uint8_t greenfromnetwork;
+uint8_t bluefromnetwork;
+uint8_t broadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+int rssi_display;
 
-String co2fromprof;
-String tempfromprof;
-String humidityfromprof;
+// Structure example to send data
+// Must match the receiver structure
+typedef struct struct_message {
+  float temperature;
+  float humidity;
+} struct_message_t;
 
-void notFound(AsyncWebServerRequest *request) {
-    request->send(404, "text/plain", "Not found");
+typedef struct struct_message_light {
+  uint8_t red;
+  uint8_t green;
+  uint8_t blue;
+} struct_message_light_t;
+
+typedef struct {
+  unsigned frame_ctrl: 16;
+  unsigned duration_id: 16;
+  uint8_t addr1[6]; /* receiver address */
+  uint8_t addr2[6]; /* sender address */
+  uint8_t addr3[6]; /* filtering address */
+  unsigned sequence_ctrl: 16;
+  uint8_t addr4[6]; /* optional */
+} wifi_ieee80211_mac_hdr_t;
+
+typedef struct {
+  wifi_ieee80211_mac_hdr_t hdr;
+  uint8_t payload[0]; /* network data ended with 4 bytes csum (CRC32) */
+} wifi_ieee80211_packet_t;
+
+// Create a struct_message called myData
+struct_message_t myData;
+struct_message_light_t myDataLight;
+
+esp_now_peer_info_t peerInfo;
+
+// callback when data is sent
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  Serial.print("\r\nLast Packet Send Status:\t");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
-const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html>
-<head>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="https://use.fontawesome.com/releases/v5.7.2/css/all.css" integrity="sha384-fnmOCqbTlWIlj8LyTjo7mOUStjsKC4pOpQbqyi7RrhN7udi9RwhKkMHpvLbHG9Sr" crossorigin="anonymous">
-  <style>
-    html {
-     font-family: Arial;
-     display: inline-block;
-     margin: 0px auto;
-     text-align: center;
-    }
-    h2 { font-size: 3.0rem; }
-    p { font-size: 3.0rem; }
-    .units { font-size: 1.2rem; }
-    .dht-labels{
-      font-size: 1.5rem;
-      vertical-align:middle;
-      padding-bottom: 15px;
-    }
-  </style>
-</head>
-<body>
-  <h2>ESP32 Server</h2>
-  <p>
-    <i class="fas fa-thermometer-half" style="color:#059e8a;"></i> 
-    <span class="dht-labels">Temperature</span> 
-    <span id="temperature">%TEMPERATURE%</span>
-    <sup class="units">&deg;C</sup>
-  </p>
-  <p>
-    <i class="fas fa-tint" style="color:#00add6;"></i> 
-    <span class="dht-labels">Humidity</span>
-    <span id="humidity">%HUMIDITY%</span>
-    <sup class="units">&percnt;</sup>
-  </p>
-  <p>
-    <i class="fas fa-wind" style="color:#00add6;"></i> 
-    <span class="dht-labels">CO2</span>
-    <span id="humidity">%CO2%</span>
-    <sup class="units">ppm</sup>
-  </p>
-  <p>
-  <form method="get" action="/ledon">
-    <input type="submit" value="LED ON">
-  </form>
-    <form method="get" action="/ledoff">
-    <input type="submit" value="LED OFF">
-  </form>
-  </p>
-</body>
-</html>)rawliteral";
+// callback function that will be executed when data is received
+void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
+  sprintf(receivedfrom, "%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+  if (len == sizeof(myData)){
+    memcpy(&myData, incomingData, sizeof(myData));
+    temperaturefromnetwork = myData.temperature;
+    humidityfromnetwork = myData.humidity;
 
-String processor(const String& var){
-  
-  //Gather data from sensor
-  sensors_event_t humidity, temp;
-  aht.getEvent(&humidity, &temp);
-
-  //Replace placeholder with data
-  if(var == "TEMPERATURE"){
-    return String(temp.temperature);
+    //Display data on serial monitor
+    // Serial.print("Bytes received: ");
+    // Serial.println(len);
+    // Serial.print("Temperature: ");
+    // Serial.println(myData.temperature);
+    // Serial.print("Humidity: ");
+    // Serial.println(myData.humidity);
+    // Serial.print("From: ");
+    // Serial.println(receivedfrom);
+    // Serial.println();
   }
-  else if(var == "HUMIDITY"){
-    return String(humidity.relative_humidity);
-  }
-    else if(var == "CO2"){
-    return co2fromprof;
-  }
-  return String();
-}
-
-void connect() {
-  Serial.print("checking wifi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(1000);
-  }
-
-  Serial.print("\nconnecting...");
-  while (!client.connect("quenting")) {
-    Serial.print(".");
-    delay(1000);
-  }
-
-  Serial.println("\nconnected!");
-
-  client.subscribe("loris/co2");
-  client.subscribe("loris/temperature");
-  client.subscribe("loris/humidity");
-  client.subscribe("quenting/led");
-}
-
-void messageReceived(String &topic, String &payload) {
-  Serial.println("incoming: " + topic + " - " + payload);
-
-  if (topic == "loris/co2") {
-    co2fromprof = payload;
-  }
-  else if (topic == "loris/temperature") {
-    tempfromprof = payload;
-  }
-  else if (topic == "loris/humidity") {
-    humidityfromprof = payload;
-  }
-  else if (topic == "quenting/led" && payload == "1") {
+  else if (len == sizeof(myDataLight))
+  {
+    memcpy(&myDataLight, incomingData, sizeof(myDataLight));
     pixels.clear();
-    pixels.setPixelColor(0, 150, 150, 150);
+    pixels.setPixelColor(0, myDataLight.red, myDataLight.green, myDataLight.blue);
     pixels.show();
+    // Serial.print("Bytes received: ");
+    // Serial.println(len);
+    // Serial.print("Red: ");
+    // Serial.println(myDataLight.red);
+    // Serial.print("Green: ");
+    // Serial.println(myDataLight.green);
+    // Serial.print("Blue: ");
+    // Serial.println(myDataLight.blue);
+    // Serial.println();
+    // Serial.print("From: ");
+    // Serial.println(receivedfrom);
+    // Serial.println();
   }
-  else if (topic == "quenting/led" && payload == "0"){
-    pixels.clear();
-    pixels.setPixelColor(0, 0, 0, 0);
-    pixels.show();
-  }
-    else if (topic == "quenting/led" && payload.charAt(0) == '#'){
-    uint32_t color = (uint32_t)strtol(&payload[1], NULL, 16);
-    pixels.clear();
-    pixels.setPixelColor(0, color);
-    pixels.show();
+  else {
+    Serial.print("Invalid packet received from : ");
+    Serial.println(receivedfrom);
   }
 }
+
+void promiscuous_rx_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
+
+    // All espnow traffic uses action frames which are a subtype of the mgmnt frames so filter out everything else.
+    if (type != WIFI_PKT_MGMT)
+        return;
+
+    static const uint8_t ACTION_SUBTYPE = 0xd0;
+    static const uint8_t ESPRESSIF_OUI[] = {0x18, 0xfe, 0x34};
+
+    const wifi_promiscuous_pkt_t *ppkt = (wifi_promiscuous_pkt_t *)buf;
+    const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)ppkt->payload;
+    const wifi_ieee80211_mac_hdr_t *hdr = &ipkt->hdr;
+
+
+   int rssi = ppkt->rx_ctrl.rssi;
+   rssi_display = rssi;
+}
+
+void IRAM_ATTR handleButtonPress()
+{
+  Serial.println("Button pressed");
+  // Set values to send
+  myDataLight.red = 0;
+  myDataLight.green = 150;
+  myDataLight.blue = 0;
+
+  // Send message via ESP-NOW
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myDataLight, sizeof(myDataLight)); 
+
+  if (result == ESP_OK) {
+    Serial.println("Sent with success");
+  }
+  else {
+    Serial.println("Error sending the data");
+  }
+
+}
+
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
-
-  //Setup of the WiFi network
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, pass);
-  Serial.println("\nConnecting");
-
-  while(WiFi.status() != WL_CONNECTED){
-      Serial.print(".");
-      delay(100);
-  }
-
-  Serial.println("\nConnected to the WiFi network");
-  Serial.print("Local ESP32 IP: ");
-  Serial.println(WiFi.localIP());
-
-  //Setup of the AHT20 sensor
   Wire.setPins(3,2);
+
+  //Setup WiFi
+  WiFi.mode(WIFI_MODE_STA);
+  WiFi.begin();
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous_rx_cb(&promiscuous_rx_cb);
+
+  //Setup OLED
+  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  Serial.println("OLED begun");
+  display.display();
+  display.clearDisplay();
+
+  //Setup AHT
   if (! aht.begin()) {
     Serial.println("Could not find AHT? Check wiring");
     while (1) delay(10);
   }
   Serial.println("AHT10 or AHT20 found");
 
-  //Setup of the MQTT client
-  client.begin("172.20.63.156", 1883, wifiClient);
-  client.onMessage(messageReceived);
+  //Setup ESP-Now
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Error initializing ESP-NOW");
+    return;
+  }
 
-  connect();
+  // Once ESPNow is successfully Init, we will register for Send CB to
+  // get the status of Transmitted packet
+  esp_now_register_send_cb(OnDataSent);
 
-  //Setup of the screen
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
+  // Register peer
+  memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+  peerInfo.channel = 0;  
+  peerInfo.encrypt = false;
 
-  //Setup of the web server
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
-    request->send_P(200, "text/html", index_html, processor);
-  });
+  // Add peer        
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
+    Serial.println("Failed to add peer");
+    return;
+  }
 
-  server.on("/ledon", HTTP_GET, [](AsyncWebServerRequest *request){
-    pixels.clear();
-    pixels.setPixelColor(0, 150, 150, 150);
-    pixels.show(); 
-    request->redirect("/");
-  });
+  // Once ESPNow is successfully Init, we will register for recv CB to
+  // get recv packer info
+  esp_now_register_recv_cb(OnDataRecv);
 
-  server.on("/ledoff", HTTP_GET, [](AsyncWebServerRequest *request){
-    pixels.clear(); 
-    pixels.setPixelColor(0, 0, 0, 0);
-    pixels.show(); 
-    request->redirect("/");
-  });
-
-  // Start server
-  server.begin();
+  //Setup button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, FALLING);
 }
 
-void loop() {
-  //Gathering temperature and humidity data
-  sensors_event_t humidity, temp;
-  aht.getEvent(&humidity, &temp);
-
-  //Displaying temperature and humidity to the screen
-  //Serial.print("Temperature: "); Serial.print(temp.temperature); Serial.println(" degrees C");
-  //Serial.print("Humidity: "); Serial.print(humidity.relative_humidity); Serial.println("% rH");
-  
-  //Displaying data to the screen
+void displayonscreen() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0,0);
+  display.print("Me:");
+  display.println(WiFi.macAddress());
+  display.print("From:");
+  display.println(receivedfrom);
+  display.print(temperaturefromnetwork);
+  display.print("C ");
+  display.print(humidityfromnetwork);
+  display.print("% ");
+  display.print(humidityfromnetwork);
+  display.print("dBm");
 
-  display.print(temp.temperature);
-  display.println("C");
-  display.print(humidity.relative_humidity);
-  display.println("%");
-  display.print(WiFi.localIP());
-  
   display.display();
   display.clearDisplay();
+  delay(500);
+}
 
-  client.loop();
+float gettemperature() {
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);
+  return temp.temperature;
+}
 
-  if (!client.connected()) {
-    connect();
+float gethumidity() {
+  sensors_event_t humidity, temp;
+  aht.getEvent(&humidity, &temp);
+  return humidity.relative_humidity;
+}
+
+void sendmessage(){
+  delay(5000);
+
+  // Set values to send
+  myData.temperature = gettemperature();
+  myData.humidity = gethumidity();
+
+  // Send message via ESP-NOW
+  esp_err_t result = esp_now_send(broadcastAddress, (uint8_t *) &myData, sizeof(myData)); 
+
+  if (result == ESP_OK) {
+    Serial.println("Sent with success");
   }
-
-  char temperature[20];
-  char humidityvalue[20];
-  sprintf(temperature, "%f", temp.temperature);
-  sprintf(humidityvalue, "%f", humidity.relative_humidity);
-
-  unsigned long lastMillis = 0;
-  if (millis() - lastMillis > 1000) {
-    lastMillis = millis();
-    client.publish("quenting/temperature", temperature);
-    client.publish("quenting/humidity", humidityvalue);
+  else {
+    Serial.println("Error sending the data");
   }
+}
 
-  delay(1000);
+void loop() {
+  displayonscreen();
+  sendmessage();
 }
